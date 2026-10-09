@@ -1,0 +1,185 @@
+---
+# Back up a Joomla site (DB dump + webroot tarball + manifest) and pull it
+# into ansible/backups/<timestamp>/. Limit to the source host, e.g.
+#   make backup host=<host>
+# DB connection details are read from the site's own configuration.php.
+- name: Back up Joomla and pull the backup to the control node
+  hosts: role_web
+  become: true
+  vars:
+    document_root: "/var/www/html"
+    backup_root: "/var/backups/joomla"
+    backup_retention: 3
+    backup_path: "{{ backup_root }}/{{ ansible_facts.date_time.iso8601_basic_short }}"
+    local_backup_root: "{{ playbook_dir }}/../backups"
+
+  tasks:
+    - name: Install the MariaDB client and rsync
+      ansible.builtin.dnf:
+        name:
+          - mariadb105
+          - rsync
+        state: present
+
+    - name: Read the DB connection from configuration.php
+      ansible.builtin.command:
+        cmd: >-
+          php -r 'require "configuration.php"; $c = new JConfig;
+          echo json_encode(["host" => $c->host, "user" => $c->user,
+          "password" => $c->password, "name" => $c->db, "prefix" => $c->dbprefix]);'
+        chdir: "{{ document_root }}"
+      register: joomla_config
+      changed_when: false
+      no_log: true
+
+    - name: Expose the DB connection as facts
+      ansible.builtin.set_fact:
+        source_db: "{{ joomla_config.stdout | from_json }}"
+      no_log: true
+
+    # MEMORY tables (Joomla's Smart Search token tables) only hold scratch data.
+    - name: Find tables that are neither InnoDB nor MEMORY
+      ansible.builtin.command:
+        cmd: >-
+          mariadb -N -h {{ source_db.host }} -u {{ source_db.user }} {{ source_db.name }}
+          -e "SELECT table_name FROM information_schema.tables
+          WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'
+          AND engine NOT IN ('InnoDB', 'MEMORY')"
+      environment:
+        MYSQL_PWD: "{{ source_db.password }}"
+      register: non_innodb_tables
+      changed_when: false
+
+    - name: Refuse to back up tables a single-transaction dump cannot snapshot
+      ansible.builtin.assert:
+        that: non_innodb_tables.stdout_lines | length == 0
+        fail_msg: "Non-InnoDB tables would be dumped inconsistently: {{ non_innodb_tables.stdout_lines | join(', ') }}"
+
+    - name: Read the DB server version
+      ansible.builtin.command:
+        cmd: mariadb -N -h {{ source_db.host }} -u {{ source_db.user }} -e "SELECT VERSION()"
+      environment:
+        MYSQL_PWD: "{{ source_db.password }}"
+      register: db_version
+      changed_when: false
+
+    - name: Read the PHP version
+      ansible.builtin.command:
+        cmd: php -r 'echo PHP_VERSION;'
+      register: php_version
+      changed_when: false
+
+    - name: Read the Joomla manifest
+      ansible.builtin.slurp:
+        src: "{{ document_root }}/administrator/manifests/files/joomla.xml"
+      register: joomla_manifest
+
+    - name: Measure the webroot
+      ansible.builtin.command:
+        cmd: du -sb {{ document_root }}
+      register: webroot_size
+      changed_when: false
+
+    - name: Create the backup directory
+      ansible.builtin.file:
+        path: "{{ backup_path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Measure free space for backups
+      ansible.builtin.command:
+        cmd: df --output=avail -B1 {{ backup_root }}
+      register: backup_free_space
+      changed_when: false
+
+    - name: Refuse to back up without room for twice the webroot
+      ansible.builtin.assert:
+        that: backup_free_space.stdout_lines[-1] | int > 2 * (webroot_size.stdout.split()[0] | int)
+        fail_msg: "Not enough free space in {{ backup_root }}"
+
+    - name: Dump the database
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail &&
+          mariadb-dump --single-transaction --routines --triggers
+          --default-character-set=utf8mb4
+          -h {{ source_db.host }} -u {{ source_db.user }} {{ source_db.name }}
+          | gzip > {{ backup_path }}/db.sql.gz
+        executable: /bin/bash
+      environment:
+        MYSQL_PWD: "{{ source_db.password }}"
+      changed_when: true
+
+    # unarchive only extracts; tar is needed to create the archive.
+    - name: Archive the webroot without caches, logs and configuration.php # noqa: command-instead-of-module
+      ansible.builtin.command:
+        cmd: >-
+          tar -czf {{ backup_path }}/files.tar.gz -C {{ document_root }}
+          --exclude=./cache/* --exclude=./tmp/* --exclude=./logs/*
+          --exclude=./administrator/cache/* --exclude=./administrator/logs/*
+          --exclude=./configuration.php .
+      register: webroot_archive
+      changed_when: true
+      # tar exits 1 when a file changes while it is read, which a live site does.
+      failed_when: webroot_archive.rc not in [0, 1]
+
+    - name: Keep the original configuration.php for the restore to adapt
+      ansible.builtin.copy:
+        src: "{{ document_root }}/configuration.php"
+        dest: "{{ backup_path }}/configuration.php.orig"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Write the backup manifest
+      ansible.builtin.copy:
+        dest: "{{ backup_path }}/manifest.json"
+        content: "{{ manifest | to_nice_json }}\n"
+        owner: root
+        group: root
+        mode: "0600"
+      vars:
+        manifest:
+          timestamp: "{{ ansible_facts.date_time.iso8601 }}"
+          source_host: "{{ inventory_hostname }}"
+          joomla_version: "{{ joomla_manifest.content | b64decode | regex_search('<version>([^<]+)</version>', '\\1') | first }}"
+          php_version: "{{ php_version.stdout }}"
+          db_version: "{{ db_version.stdout }}"
+          db_prefix: "{{ source_db.prefix }}"
+
+    - name: Find existing backups
+      ansible.builtin.find:
+        paths: "{{ backup_root }}"
+        file_type: directory
+      register: existing_backups
+
+    - name: Remove all but the newest backups
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ (existing_backups.files | map(attribute='path') | sort)[:-backup_retention] }}"
+
+    - name: Ensure the local backups directory exists
+      ansible.builtin.file:
+        path: "{{ local_backup_root }}"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      become: false
+
+    - name: Pull the backup to the control node
+      ansible.posix.synchronize:
+        mode: pull
+        src: "{{ backup_path }}"
+        dest: "{{ local_backup_root }}/"
+
+    - name: Point backups/latest at the pulled backup
+      ansible.builtin.file:
+        src: "{{ backup_path | basename }}"
+        dest: "{{ local_backup_root }}/latest"
+        state: link
+      delegate_to: localhost
+      become: false

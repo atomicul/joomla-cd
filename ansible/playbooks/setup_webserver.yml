@@ -1,0 +1,63 @@
+---
+- name: Set up Nginx Web Server
+  hosts: role_web
+  become: true
+
+  handlers:
+    - name: Reload Nginx
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded
+
+  tasks:
+    - name: Ensure Nginx is installed
+      ansible.builtin.package:
+        name: nginx
+        state: present
+        update_cache: true
+
+    - name: Ensure document root directory exists
+      ansible.builtin.file:
+        path: /data/www/html
+        state: directory
+        owner: nginx
+        group: nginx
+        mode: '0755'
+
+    - name: Configure Nginx server block
+      ansible.builtin.copy:
+        dest: /etc/nginx/conf.d/static_site.conf
+        content: |
+          server {
+              listen 80;
+              server_name _;
+              root /data/www/html;
+              index index.html;
+
+              location / {
+                  try_files $uri $uri/ =404;
+              }
+          }
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Reload Nginx
+
+    - name: Deploy custom index page
+      ansible.builtin.copy:
+        dest: /data/www/html/index.html
+        content: |
+          <!DOCTYPE html>
+          <html>
+            <head><title>Managed by Ansible</title></head>
+            <body><h1>Hello from {{ inventory_hostname }}</h1></body>
+          </html>
+        owner: nginx
+        group: nginx
+        mode: '0644'
+
+    - name: Ensure Nginx service is enabled and running
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: true

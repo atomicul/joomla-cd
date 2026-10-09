@@ -1,0 +1,17 @@
+plugin: amazon.aws.aws_ec2
+regions:
+  - eu-central-1
+filters:
+  instance-state-name: running
+keyed_groups:
+  # A single instance can hold multiple roles via a comma-separated Role tag,
+  # e.g. Role="web,db" joins both role_web and role_db.
+  - key: ec2_tags.Role | split(',') | map('trim') | list
+    prefix: role
+hostnames:
+  - ip-address
+  - dns-name
+  - instance-id
+compose:
+  ansible_host: public_ip_address
+  ansible_user: "'ec2-user'"

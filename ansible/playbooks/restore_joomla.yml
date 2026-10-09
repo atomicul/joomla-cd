@@ -1,0 +1,355 @@
+---
+# Restore a backup made by backup_joomla.yml onto another host, sanitised so
+# it cannot send mail, run scheduled tasks or get indexed. Limit to the target
+# host(s), e.g.
+#   make restore host=<host>
+# Restores the newest backup in ansible/backups/ unless backup=<path>
+# (-e backup_dir=<path>).
+# Optional: -e anonymise_users=true, -e '{"disable_extensions": ["elem", ...]}',
+# -e reset_admin_username=<user> -e reset_admin_password=<password>.
+# With -e promote=true it restores onto a live site instead: nothing is
+# sanitised, and the target keeps its own mail, indexing, caching and URL
+# settings, .htaccess, scheduled task states and update sites.
+- name: Check the restore request
+  hosts: role_db:role_web
+  gather_facts: false
+  any_errors_fatal: true
+  vars_files:
+    - vars/restore.yml
+
+  tasks:
+    - name: Refuse to restore without explicit confirmation
+      ansible.builtin.assert:
+        that: restore_confirm | default(false) | bool
+        fail_msg: "Restoring wipes the target's DB and webroot; pass -e restore_confirm=true"
+
+    - name: Refuse to restore an incomplete backup
+      ansible.builtin.assert:
+        that: (restore_dir ~ '/' ~ item) is file
+        fail_msg: "{{ item }} is missing from '{{ restore_dir }}'"
+      loop:
+        - manifest.json
+        - db.sql.gz
+        - files.tar.gz
+        - configuration.php.orig
+
+    - name: Refuse to restore into more than one database host
+      ansible.builtin.assert:
+        that: groups['role_db'] | intersect(ansible_play_hosts_all) | length == 1
+        fail_msg: "Limit the run to a single role_db host"
+
+    - name: Refuse to restore over the backup's own source
+      ansible.builtin.assert:
+        that: inventory_hostname != manifest.source_host
+        fail_msg: "{{ inventory_hostname }} is the host this backup was taken from"
+      when: not promoting
+
+    - name: Refuse to sanitise a site that is being promoted
+      ansible.builtin.assert:
+        that:
+          - anonymise_users is not defined
+          - disable_extensions is not defined
+          - reset_admin_username is not defined
+          - reset_admin_password is not defined
+        fail_msg: "anonymise_users, disable_extensions and reset_admin_* only apply without promote=true"
+      when: promoting
+
+- name: Set up the database server
+  ansible.builtin.import_playbook: setup_database.yml
+
+- name: Restore the Joomla database
+  hosts: role_db
+  become: true
+  vars_files:
+    - vars/restore.yml
+  vars:
+    db_prefix: "{{ manifest.db_prefix }}"
+    staging_dir: /root/joomla-restore
+    mysql_socket: /var/lib/mysql/mysql.sock
+
+  tasks:
+    - name: Create the staging directory
+      ansible.builtin.file:
+        path: "{{ staging_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Copy the database dump
+      ansible.builtin.copy:
+        src: "{{ restore_dir }}/db.sql.gz"
+        dest: "{{ staging_dir }}/db.sql.gz"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Look for MySQL 8 collations that MariaDB cannot import
+      ansible.builtin.command:
+        cmd: zgrep -q utf8mb4_0900_ {{ staging_dir }}/db.sql.gz
+      register: mysql8_collations
+      changed_when: false
+      failed_when: mysql8_collations.rc > 1
+
+    - name: Refuse to import a dump MariaDB would reject
+      ansible.builtin.assert:
+        that: mysql8_collations.rc == 1
+        fail_msg: "The dump uses MySQL 8 utf8mb4_0900_* collations ({{ manifest.db_version }}); convert them first"
+
+    - name: Look for emails replaced by anonymise_users
+      ansible.builtin.command:
+        cmd: zgrep -q @example.invalid {{ staging_dir }}/db.sql.gz
+      register: anonymised_emails
+      changed_when: false
+      failed_when: anonymised_emails.rc > 1
+      when: promoting
+
+    - name: Refuse to promote a dump with anonymised users
+      ansible.builtin.assert:
+        that: anonymised_emails.rc == 1
+        fail_msg: "The dump has @example.invalid emails; it comes from an anonymised copy"
+      when: promoting
+
+    - name: Read the target's scheduled task and update site states
+      ansible.mariadb.mariadb_query:
+        login_db: "{{ db_name }}"
+        login_unix_socket: "{{ mysql_socket }}"
+        query:
+          - "SELECT id, state FROM {{ db_prefix }}scheduler_tasks"
+          - "SELECT update_site_id, enabled FROM {{ db_prefix }}update_sites"
+      register: target_states
+      when: promoting
+
+    - name: Drop the existing Joomla database
+      ansible.mariadb.mariadb_db:
+        name: "{{ db_name }}"
+        state: absent
+        login_unix_socket: "{{ mysql_socket }}"
+
+    - name: Import the dump into a fresh Joomla database
+      ansible.mariadb.mariadb_db:
+        name: "{{ db_name }}"
+        state: import
+        target: "{{ staging_dir }}/db.sql.gz"
+        login_unix_socket: "{{ mysql_socket }}"
+
+    - name: Disable scheduled tasks and update checks
+      ansible.mariadb.mariadb_query:
+        login_db: "{{ db_name }}"
+        login_unix_socket: "{{ mysql_socket }}"
+        query:
+          - "UPDATE {{ db_prefix }}scheduler_tasks SET state = 0"
+          - "UPDATE {{ db_prefix }}update_sites SET enabled = 0"
+      when: not promoting
+
+    - name: Put back the target's scheduled task states
+      ansible.mariadb.mariadb_query:
+        login_db: "{{ db_name }}"
+        login_unix_socket: "{{ mysql_socket }}"
+        query: "UPDATE {{ db_prefix }}scheduler_tasks SET state = %(state)s WHERE id = %(id)s"
+        named_args: "{{ item }}"
+      loop: "{{ target_states.query_result[0] }}"
+      when: promoting
+
+    - name: Put back the target's update site states
+      ansible.mariadb.mariadb_query:
+        login_db: "{{ db_name }}"
+        login_unix_socket: "{{ mysql_socket }}"
+        query: "UPDATE {{ db_prefix }}update_sites SET enabled = %(enabled)s WHERE update_site_id = %(update_site_id)s"
+        named_args: "{{ item }}"
+      loop: "{{ target_states.query_result[1] }}"
+      when: promoting
+
+    - name: Disable extensions that talk to outside services
+      ansible.mariadb.mariadb_query:
+        login_db: "{{ db_name }}"
+        login_unix_socket: "{{ mysql_socket }}"
+        query: "UPDATE {{ db_prefix }}extensions SET enabled = 0 WHERE element = %s"
+        positional_args:
+          - "{{ item }}"
+      loop: "{{ disable_extensions | default([]) }}"
+
+    - name: Replace user emails with unroutable addresses
+      ansible.mariadb.mariadb_query:
+        login_db: "{{ db_name }}"
+        login_unix_socket: "{{ mysql_socket }}"
+        query: "UPDATE {{ db_prefix }}users SET email = CONCAT('user', id, '@example.invalid')"
+      when: anonymise_users | default(false) | bool
+
+    - name: Remove the staging directory
+      ansible.builtin.file:
+        path: "{{ staging_dir }}"
+        state: absent
+
+    - name: Record this host as the restored database
+      ansible.builtin.set_fact:
+        restored_db_host: "{{ private_ip_address }}"
+
+- name: Set up the web stack
+  ansible.builtin.import_playbook: setup_web_stack.yml
+
+- name: Restore the Joomla files
+  hosts: role_web
+  become: true
+  vars_files:
+    - vars/restore.yml
+  vars:
+    document_root: "/var/www/html"
+    config_path: "{{ document_root }}/configuration.php"
+    host_settings:
+      host: >-
+        {{ (groups['role_db'] | map('extract', hostvars)
+            | selectattr('restored_db_host', 'defined') | first).restored_db_host }}
+      user: "{{ db_user }}"
+      password: "{{ db_password }}"
+      db: "{{ db_name }}"
+      log_path: "{{ document_root }}/administrator/logs"
+      tmp_path: "{{ document_root }}/tmp"
+    sanitised_settings:
+      live_site: ""
+      cookie_domain: ""
+      force_ssl: 0
+      caching: 0
+      cache_handler: file
+      session_handler: database
+      mailonline: false
+      robots: "noindex, nofollow"
+    target_settings: >-
+      {{ target_config.stdout | from_json | dict2items
+         | selectattr('key', 'in', sanitised_settings) | items2dict }}
+    config_overrides: "{{ host_settings | combine(target_settings if promoting else sanitised_settings) }}"
+
+  tasks:
+    - name: Read the target's configuration.php
+      ansible.builtin.command:
+        cmd: php -r 'require "configuration.php"; echo json_encode(get_object_vars(new JConfig));'
+        chdir: "{{ document_root }}"
+      register: target_config
+      changed_when: false
+      no_log: true
+      when: promoting
+
+    - name: Look for the target's .htaccess
+      ansible.builtin.stat:
+        path: "{{ document_root }}/.htaccess"
+      register: target_htaccess_stat
+      when: promoting
+
+    - name: Read the target's .htaccess
+      ansible.builtin.slurp:
+        src: "{{ document_root }}/.htaccess"
+      register: target_htaccess
+      when:
+        - promoting
+        - target_htaccess_stat.stat.exists
+
+    - name: Stop Apache while the webroot is replaced
+      ansible.builtin.service:
+        name: httpd
+        state: stopped
+
+    - name: Remove the existing webroot
+      ansible.builtin.file:
+        path: "{{ document_root }}"
+        state: absent
+
+    - name: Recreate the webroot
+      ansible.builtin.file:
+        path: "{{ document_root }}"
+        state: directory
+        owner: apache
+        group: apache
+        mode: "0755"
+
+    - name: Extract the backed-up files
+      ansible.builtin.unarchive:
+        src: "{{ restore_dir }}/files.tar.gz"
+        dest: "{{ document_root }}"
+        extra_opts:
+          - --no-same-owner
+
+    - name: Restore the original configuration.php
+      ansible.builtin.copy:
+        src: "{{ restore_dir }}/configuration.php.orig"
+        dest: "{{ config_path }}"
+        owner: apache
+        group: apache
+        mode: "0640"
+
+    - name: Copy the configuration override helper
+      ansible.builtin.copy:
+        src: joomla_config_set.php
+        dest: /root/joomla_config_set.php
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Point configuration.php at this host and set its mail, caching and indexing
+      ansible.builtin.command:
+        cmd: php /root/joomla_config_set.php {{ config_path }}
+        stdin: "{{ config_overrides | to_json }}"
+      changed_when: true
+      no_log: true
+
+    - name: Remove the configuration override helper
+      ansible.builtin.file:
+        path: /root/joomla_config_set.php
+        state: absent
+
+    # The source's .htaccess may redirect to its own domain; use Joomla's stock one.
+    - name: Replace .htaccess with Joomla's stock rules
+      ansible.builtin.copy:
+        src: "{{ document_root }}/htaccess.txt"
+        dest: "{{ document_root }}/.htaccess"
+        remote_src: true
+        mode: "0644"
+      when: not promoting
+
+    - name: Put back the target's .htaccess
+      ansible.builtin.copy:
+        content: "{{ target_htaccess.content | b64decode }}"
+        dest: "{{ document_root }}/.htaccess"
+        mode: "0644"
+      when:
+        - promoting
+        - target_htaccess_stat.stat.exists
+
+    - name: Remove the backup's .htaccess, as the target had none
+      ansible.builtin.file:
+        path: "{{ document_root }}/.htaccess"
+        state: absent
+      when:
+        - promoting
+        - not target_htaccess_stat.stat.exists
+
+    - name: Reset the admin password
+      ansible.builtin.command:
+        cmd: >-
+          php cli/joomla.php user:reset-password --no-interaction
+          --username="{{ reset_admin_username }}" --password="{{ reset_admin_password }}"
+        chdir: "{{ document_root }}"
+      changed_when: true
+      no_log: true
+      when:
+        - reset_admin_username is defined
+        - reset_admin_password is defined
+
+    - name: Set correct ownership for Joomla files
+      ansible.builtin.file:
+        path: "{{ document_root }}"
+        state: directory
+        owner: apache
+        group: apache
+        recurse: true
+
+    - name: Start Apache
+      ansible.builtin.service:
+        name: httpd
+        state: started
+
+    - name: Check the site and administrator respond
+      ansible.builtin.uri:
+        url: "http://localhost{{ item }}"
+      loop:
+        - /
+        - /administrator/

@@ -1,0 +1,30 @@
+---
+- name: Set up Apache and PHP for Joomla on Amazon Linux 2023
+  hosts: role_web
+  become: true
+
+  tasks:
+    - name: Install Apache, PHP, and required dependencies
+      ansible.builtin.dnf:
+        name:
+          - httpd
+          - php
+          - php-mysqlnd
+          - php-xml
+          - php-gd
+          - php-mbstring
+          - php-intl
+          - php-zip
+          - unzip
+          - wget
+        state: present
+        update_cache: true
+
+    - name: Ensure Apache and PHP-FPM are running and enabled on boot
+      ansible.builtin.service:
+        name: "{{ item }}"
+        state: started
+        enabled: true
+      loop:
+        - php-fpm
+        - httpd

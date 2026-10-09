@@ -1,0 +1,6 @@
+---
+# Shared Joomla database connection facts, referenced by setup_database.yml
+# and setup_joomla.yml.
+db_name: joomla_db
+db_user: joomla_user
+db_password: "ChangeThisStrongPassword123!" # change before any real use

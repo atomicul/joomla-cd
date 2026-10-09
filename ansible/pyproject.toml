@@ -1,0 +1,12 @@
+[project]
+name = "ansible"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = "~=3.14.0"
+dependencies = [
+    "ansible-core>=2.21.5",
+    "ansible-lint>=26.9.0",
+    "boto3>=1.43.109",
+    "botocore>=1.43.109",
+]

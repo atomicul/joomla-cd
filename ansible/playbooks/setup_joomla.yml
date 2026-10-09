@@ -1,0 +1,70 @@
+---
+- name: Set up the web stack
+  ansible.builtin.import_playbook: setup_web_stack.yml
+
+- name: Set up Joomla on Amazon Linux 2023
+  hosts: role_web
+  become: true
+  vars:
+    # Joomla Download URL (Update to the latest version if necessary)
+    joomla_url: "https://downloads.joomla.org/cms/joomla5/5-0-3/Joomla_5-0-3-Stable-Full_Package.zip"
+    document_root: "/var/www/html"
+
+    # Private IP of the role_db host, preferring this host when it is one;
+    # the security group only allows 3306 from itself, so the public IP
+    # would be dropped.
+    db_host: >-
+      {{ hostvars[inventory_hostname if inventory_hostname in groups['role_db']
+                  else groups['role_db'][0]].private_ip_address }}
+    db_prefix: "jos_"
+
+    # Joomla site/admin configuration (used to skip the web install wizard)
+    site_name: "Joomla CD"
+    admin_user: "Administrator"
+    admin_username: "admin"
+    admin_password: "ChangeThisAdminPwd123!" # change before any real use
+    admin_email: "admin@example.com"
+
+  tasks:
+    - name: Ensure document root is empty before extracting Joomla
+      ansible.builtin.file:
+        path: "{{ document_root }}/index.html"
+        state: absent
+
+    - name: Download and extract Joomla to the document root
+      ansible.builtin.unarchive:
+        src: "{{ joomla_url }}"
+        dest: "{{ document_root }}"
+        remote_src: true
+        owner: apache
+        group: apache
+        creates: "{{ document_root }}/configuration.php"
+
+    - name: Run the Joomla CLI installer (skips the web install wizard)
+      ansible.builtin.command:
+        cmd: >
+          php installation/joomla.php install
+          --site-name="{{ site_name }}"
+          --admin-user="{{ admin_user }}"
+          --admin-username="{{ admin_username }}"
+          --admin-password="{{ admin_password }}"
+          --admin-email="{{ admin_email }}"
+          --db-type=mysqli
+          --db-host="{{ db_host }}"
+          --db-user="{{ db_user }}"
+          --db-pass="{{ db_password }}"
+          --db-name="{{ db_name }}"
+          --db-prefix="{{ db_prefix }}"
+          --db-encryption=0
+          --no-interaction
+        chdir: "{{ document_root }}"
+        creates: "{{ document_root }}/configuration.php"
+      no_log: true
+
+    - name: Set correct ownership and permissions for Joomla files
+      ansible.builtin.file:
+        path: "{{ document_root }}"
+        state: directory
+        owner: apache
+        group: apache
+        recurse: true
