@@ -4,6 +4,7 @@
 local_backup_root: "{{ playbook_dir }}/../backups"
 restore_dir: "{{ backup_dir | default(local_backup_root ~ '/latest') | realpath }}"
 manifest: "{{ lookup('ansible.builtin.file', restore_dir ~ '/manifest.json') | from_json }}"
+originals: "{{ lookup('ansible.builtin.file', restore_dir ~ '/originals.json') | from_json }}"
 # -e promote=true restores onto a live site, keeping its own settings instead
 # of sanitising it.
 promoting: "{{ promote | default(false) | bool }}"

@@ -17,7 +17,7 @@ help:
 	@echo "    [backup=backups/<timestamp>]  - Backup to restore (default: backups/latest)"
 	@echo "  make promote host=<live> backup=backups/<timestamp>"
 	@echo "                                  - Back up a live site, then restore a backup over it"
-	@echo "                                    keeping its own settings (also rolls back)"
+	@echo "                                    with the settings its backup recorded (also rolls back)"
 	@echo ""
 	@echo "Playbook targets take [args='...'] for extra ansible-playbook arguments."
 

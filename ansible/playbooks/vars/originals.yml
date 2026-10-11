@@ -1,0 +1,15 @@
+---
+# configuration.php settings a restore sanitises. A backup records their
+# original values in originals.json, and a promote puts those back.
+sanitised_settings:
+  live_site: ""
+  cookie_domain: ""
+  force_ssl: 0
+  caching: 0
+  cache_handler: file
+  session_handler: database
+  mailonline: false
+  robots: "noindex, nofollow"
+# Where a sanitised host keeps the originals of the backup it was restored
+# from, so that its own backups record those instead of its sanitised state.
+originals_stash: /etc/joomla-cd/originals.json

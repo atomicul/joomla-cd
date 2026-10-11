@@ -3,9 +3,13 @@
 # into ansible/backups/<timestamp>/. Limit to the source host, e.g.
 #   make backup host=<host>
 # DB connection details are read from the site's own configuration.php.
+# originals.json records the settings a restore sanitises: the site's own, or,
+# on a sanitised host, those of the backup it was restored from.
 - name: Back up Joomla and pull the backup to the control node
   hosts: role_web
   become: true
+  vars_files:
+    - vars/originals.yml
   vars:
     document_root: "/var/www/html"
     backup_root: "/var/backups/joomla"
@@ -133,6 +137,72 @@
         owner: root
         group: root
         mode: "0600"
+
+    - name: Look for originals stashed by a restore
+      ansible.builtin.stat:
+        path: "{{ originals_stash }}"
+      register: stashed_originals
+
+    - name: Record the originals of the backup this host was restored from
+      ansible.builtin.copy:
+        src: "{{ originals_stash }}"
+        dest: "{{ backup_path }}/originals.json"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+      when: stashed_originals.stat.exists
+
+    - name: Record this site's own settings for a promote to put back
+      when: not stashed_originals.stat.exists
+      block:
+        - name: Read the site's configuration.php
+          ansible.builtin.command:
+            cmd: php -r 'require "configuration.php"; echo json_encode(get_object_vars(new JConfig));'
+            chdir: "{{ document_root }}"
+          register: live_config
+          changed_when: false
+          no_log: true
+
+        - name: Read the scheduled task and update site states
+          ansible.builtin.command:
+            cmd: >-
+              mariadb -N -h {{ source_db.host }} -u {{ source_db.user }} {{ source_db.name }}
+              -e "SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT('id', id, 'state', state)), '[]')
+              FROM {{ source_db.prefix }}scheduler_tasks;
+              SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT('update_site_id', update_site_id, 'enabled', enabled)), '[]')
+              FROM {{ source_db.prefix }}update_sites"
+          environment:
+            MYSQL_PWD: "{{ source_db.password }}"
+          register: live_states
+          changed_when: false
+
+        - name: Look for the site's .htaccess
+          ansible.builtin.stat:
+            path: "{{ document_root }}/.htaccess"
+          register: live_htaccess_stat
+
+        - name: Read the site's .htaccess
+          ansible.builtin.slurp:
+            src: "{{ document_root }}/.htaccess"
+          register: live_htaccess
+          when: live_htaccess_stat.stat.exists
+
+        - name: Write the site's originals
+          ansible.builtin.copy:
+            dest: "{{ backup_path }}/originals.json"
+            content: "{{ originals | to_nice_json }}\n"
+            owner: root
+            group: root
+            mode: "0600"
+          vars:
+            originals:
+              settings: >-
+                {{ live_config.stdout | from_json | dict2items
+                   | selectattr('key', 'in', sanitised_settings) | items2dict }}
+              scheduler_tasks: "{{ live_states.stdout_lines[0] | from_json }}"
+              update_sites: "{{ live_states.stdout_lines[1] | from_json }}"
+              htaccess: "{{ (live_htaccess.content | b64decode) if live_htaccess_stat.stat.exists else none }}"
 
     - name: Write the backup manifest
       ansible.builtin.copy:

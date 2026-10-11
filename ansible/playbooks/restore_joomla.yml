@@ -7,9 +7,12 @@
 # (-e backup_dir=<path>).
 # Optional: -e anonymise_users=true, -e '{"disable_extensions": ["elem", ...]}',
 # -e reset_admin_username=<user> -e reset_admin_password=<password>.
+# A sanitised target keeps the backup's originals.json, so that its own
+# backups carry the originals instead of its sanitised state.
 # With -e promote=true it restores onto a live site instead: nothing is
-# sanitised, and the target keeps its own mail, indexing, caching and URL
-# settings, .htaccess, scheduled task states and update sites.
+# sanitised, and the mail, indexing, caching and URL settings, .htaccess,
+# scheduled task states and update sites recorded in originals.json are put
+# back. Nothing is read from the target.
 - name: Check the restore request
   hosts: role_db:role_web
   gather_facts: false
@@ -32,6 +35,7 @@
         - db.sql.gz
         - files.tar.gz
         - configuration.php.orig
+        - originals.json
 
     - name: Refuse to restore into more than one database host
       ansible.builtin.assert:
@@ -110,16 +114,6 @@
         fail_msg: "The dump has @example.invalid emails; it comes from an anonymised copy"
       when: promoting
 
-    - name: Read the target's scheduled task and update site states
-      ansible.mariadb.mariadb_query:
-        login_db: "{{ db_name }}"
-        login_unix_socket: "{{ mysql_socket }}"
-        query:
-          - "SELECT id, state FROM {{ db_prefix }}scheduler_tasks"
-          - "SELECT update_site_id, enabled FROM {{ db_prefix }}update_sites"
-      register: target_states
-      when: promoting
-
     - name: Drop the existing Joomla database
       ansible.mariadb.mariadb_db:
         name: "{{ db_name }}"
@@ -142,22 +136,22 @@
           - "UPDATE {{ db_prefix }}update_sites SET enabled = 0"
       when: not promoting
 
-    - name: Put back the target's scheduled task states
+    - name: Put back the original scheduled task states
       ansible.mariadb.mariadb_query:
         login_db: "{{ db_name }}"
         login_unix_socket: "{{ mysql_socket }}"
         query: "UPDATE {{ db_prefix }}scheduler_tasks SET state = %(state)s WHERE id = %(id)s"
         named_args: "{{ item }}"
-      loop: "{{ target_states.query_result[0] }}"
+      loop: "{{ originals.scheduler_tasks }}"
       when: promoting
 
-    - name: Put back the target's update site states
+    - name: Put back the original update site states
       ansible.mariadb.mariadb_query:
         login_db: "{{ db_name }}"
         login_unix_socket: "{{ mysql_socket }}"
         query: "UPDATE {{ db_prefix }}update_sites SET enabled = %(enabled)s WHERE update_site_id = %(update_site_id)s"
         named_args: "{{ item }}"
-      loop: "{{ target_states.query_result[1] }}"
+      loop: "{{ originals.update_sites }}"
       when: promoting
 
     - name: Disable extensions that talk to outside services
@@ -193,6 +187,7 @@
   become: true
   vars_files:
     - vars/restore.yml
+    - vars/originals.yml
   vars:
     document_root: "/var/www/html"
     config_path: "{{ document_root }}/configuration.php"
@@ -205,44 +200,9 @@
       db: "{{ db_name }}"
       log_path: "{{ document_root }}/administrator/logs"
       tmp_path: "{{ document_root }}/tmp"
-    sanitised_settings:
-      live_site: ""
-      cookie_domain: ""
-      force_ssl: 0
-      caching: 0
-      cache_handler: file
-      session_handler: database
-      mailonline: false
-      robots: "noindex, nofollow"
-    target_settings: >-
-      {{ target_config.stdout | from_json | dict2items
-         | selectattr('key', 'in', sanitised_settings) | items2dict }}
-    config_overrides: "{{ host_settings | combine(target_settings if promoting else sanitised_settings) }}"
+    config_overrides: "{{ host_settings | combine(originals.settings if promoting else sanitised_settings) }}"
 
   tasks:
-    - name: Read the target's configuration.php
-      ansible.builtin.command:
-        cmd: php -r 'require "configuration.php"; echo json_encode(get_object_vars(new JConfig));'
-        chdir: "{{ document_root }}"
-      register: target_config
-      changed_when: false
-      no_log: true
-      when: promoting
-
-    - name: Look for the target's .htaccess
-      ansible.builtin.stat:
-        path: "{{ document_root }}/.htaccess"
-      register: target_htaccess_stat
-      when: promoting
-
-    - name: Read the target's .htaccess
-      ansible.builtin.slurp:
-        src: "{{ document_root }}/.htaccess"
-      register: target_htaccess
-      when:
-        - promoting
-        - target_htaccess_stat.stat.exists
-
     - name: Stop Apache while the webroot is replaced
       ansible.builtin.service:
         name: httpd
@@ -305,22 +265,46 @@
         mode: "0644"
       when: not promoting
 
-    - name: Put back the target's .htaccess
+    - name: Put back the original .htaccess
       ansible.builtin.copy:
-        content: "{{ target_htaccess.content | b64decode }}"
+        content: "{{ originals.htaccess }}"
         dest: "{{ document_root }}/.htaccess"
         mode: "0644"
       when:
         - promoting
-        - target_htaccess_stat.stat.exists
+        - originals.htaccess is not none
 
-    - name: Remove the backup's .htaccess, as the target had none
+    - name: Remove the backup's .htaccess, as the original site had none
       ansible.builtin.file:
         path: "{{ document_root }}/.htaccess"
         state: absent
       when:
         - promoting
-        - not target_htaccess_stat.stat.exists
+        - originals.htaccess is none
+
+    - name: Create the originals stash directory
+      ansible.builtin.file:
+        path: "{{ originals_stash | dirname }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      when: not promoting
+
+    - name: Stash the originals, so that backups of this sanitised site carry them
+      ansible.builtin.copy:
+        src: "{{ restore_dir }}/originals.json"
+        dest: "{{ originals_stash }}"
+        owner: root
+        group: root
+        mode: "0600"
+      when: not promoting
+
+    - name: Remove the stashed originals, as this site is live again
+      ansible.builtin.file:
+        path: "{{ originals_stash }}"
+        state: absent
+      when: promoting
 
     - name: Reset the admin password
       ansible.builtin.command:

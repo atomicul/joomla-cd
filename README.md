@@ -6,7 +6,7 @@ a restore, so that changes are made on a dev copy instead of on production:
 1. back up prod and restore it onto dev, sanitised so dev cannot send mail,
    run scheduled tasks or get indexed,
 2. make and test the changes on dev,
-3. back up dev and promote it onto prod, keeping prod's own settings.
+3. back up dev and promote it onto prod, putting prod's own settings back.
 
 Each step copies the whole site, database and files together. Nothing is
 merged, so the workflow assumes prod is read-only while dev is being worked
@@ -69,17 +69,22 @@ registration is up to you.
 
 ## Promoting dev onto prod
 
-Dev's backup carries dev's sanitised state, so promoting does not just skip the
-sanitising: it reads prod's own environment just before wiping it and puts it
-back over dev's copy.
+Dev's copy is sanitised, so promoting does not just skip the sanitising: it
+puts back the settings prod had when it was backed up. Every backup records
+them in `originals.json`. A restore onto dev keeps that file on the host
+(`/etc/joomla-cd/originals.json`), and a backup of dev records it instead of
+dev's sanitised state. Promoting never reads the host it replaces.
 
-| Kept from prod | Taken from dev |
+| From prod's backup (`originals.json`) | Taken from dev |
 | --- | --- |
-| Mail, robots, caching, Force HTTPS, cookie domain, `$live_site`, session and cache handlers | Everything else in Global Configuration (site name, SEF, metadata, ...) |
+| Mail on/off, robots, caching, Force HTTPS, cookie domain, `$live_site`, session and cache handlers | Everything else in Global Configuration (site name, SEF, metadata, mail server, ...) |
 | `.htaccess` (or none, if prod had none) | Articles, categories, menus, modules, users |
 | Scheduled task states and update site switches, for rows that existed on prod | Extensions, templates and their settings |
 
-The DB connection in `configuration.php` always points at prod's own database.
+The DB connection in `configuration.php` always points at the promoted host's
+own database. Since nothing is read from that host, dev can be promoted onto
+a different machine than the prod it came from, and it gets that prod's
+settings.
 
 ### Rolling back
 
@@ -93,8 +98,11 @@ make promote host=<prod> backup=backups/<timestamp>
 
 ### Gotchas
 
-- Changes to the kept Global Configuration settings cannot be promoted. Make
-  them on prod after promoting.
+- Changes to the Global Configuration settings from prod's backup cannot be
+  promoted. Make them on prod after promoting.
+- Backups without `originals.json` are refused. A dev restored before it
+  existed has nothing stashed, so its backups would record its sanitised
+  settings: restore it again from a new prod backup.
 - Data changed by sanitising options on dev travels to prod.
   `disable_extensions` leaves those extensions disabled, and
   `reset_admin_password` leaves that admin with the dev password. Promoting
@@ -105,8 +113,6 @@ make promote host=<prod> backup=backups/<timestamp>
 - The site is down while prod is promoted: Apache is stopped, the database is
   dropped and the webroot deleted before the new copy goes in. If the promote
   fails half way, prod stays broken until rolled back.
-- Promoting needs a working Joomla on prod; it fails, before changing
-  anything, if prod has no database to read its settings from.
 - Instances are addressed by public IP. Stopping and starting one gives it a
   new IP, so update the `host=` you use, and the "not onto its own source"
   guard of `make restore` no longer recognises it.

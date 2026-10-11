@@ -41,7 +41,9 @@ make restore host=<target>
 
 The backup reads the DB connection from the source's `configuration.php`,
 dumps the DB, tars the webroot without caches and logs, and writes a
-`manifest.json`. The source keeps the newest 3 backups under
+`manifest.json`. It also writes `originals.json`, the values of everything a
+restore sanitises: the source's own, or, if the source is itself a sanitised
+restore, the ones stashed from the backup it was restored from. The source keeps the newest 3 backups under
 `/var/backups/joomla/`; `ansible/backups/latest` points at the last one pulled.
 Local backups are never pruned.
 
@@ -53,7 +55,10 @@ target it:
 - imports the dump and disables scheduled tasks and update checks,
 - keeps the source's `configuration.php` but points it at the target DB and
   turns off mail, caching and indexing (`robots` noindex),
-- replaces `.htaccess` with Joomla's stock `htaccess.txt`.
+- replaces `.htaccess` with Joomla's stock `htaccess.txt`,
+- stashes the backup's `originals.json` in `/etc/joomla-cd/`.
+
+Backups without `originals.json` are refused.
 
 The target DB name, user and password come from `group_vars/all.yml`, not from
 the source.
@@ -78,12 +83,14 @@ make promote host=<prod> backup=backups/<timestamp>
 This first backs the live site up like `make backup`, then runs
 `restore_joomla.yml` with `-e promote=true`. In that mode the restore:
 
-- reads the target's `configuration.php`, `.htaccess`, scheduled task states
-  and update site switches before wiping it,
-- imports the backup without sanitising it, then puts those back: the
-  target's mail, robots, caching, Force HTTPS, cookie domain, `$live_site` and
-  session/cache handler settings, its `.htaccess` (or none), and its task and
-  update site states for every row it had,
+- imports the backup without sanitising it, then puts back what its
+  `originals.json` recorded: the mail on/off, robots, caching, Force HTTPS,
+  cookie domain, `$live_site` and session/cache handler settings, the
+  `.htaccess` (or none), and the task and update site states for every row
+  recorded,
+- reads nothing from the target, so the target can be a different host than
+  the prod the backup's originals came from,
+- removes the target's stashed originals, if any,
 - allows restoring a backup onto the host it came from, which is how a promote
   is rolled back,
 - refuses `anonymise_users`, `disable_extensions` and `reset_admin_*`, and
